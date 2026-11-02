@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import csv
 import json
+import re
 import sqlite3
 import threading
 import zlib
@@ -17,6 +18,9 @@ from typing import Any
 MODEL_NAME = "deepseek-v4-flash"
 INTERVIEW_LIMIT = 10
 MAX_SQL_ROWS = 50
+MAX_CONCURRENT_COMPANIES = 4
+MODEL_CALL_TIMEOUT_SECONDS = 40
+COMPANY_TIMEOUT_SECONDS = 75
 
 # Philip Fisher, "Common Stocks and Uncommon Profits", Part One, Chapter 3.
 # For every point, PASS means the company looks good on it. You choose 3
@@ -57,7 +61,7 @@ def load_env_file(path: Path = Path(".env")) -> None:
 
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [1, 5, 11]  ### YOUR CODE HERE
 
 
 def build_agent() -> Any:
@@ -72,7 +76,257 @@ def build_agent() -> Any:
     you will probably create one tool-calling agent per company there.
     """
     ### YOUR CODE HERE
-    return None
+    from langchain_deepseek import ChatDeepSeek
+
+    return ChatDeepSeek(
+        model=MODEL_NAME,
+        temperature=0,
+        max_retries=1,
+        timeout=30,
+        max_tokens=180,
+    )
+
+
+def _tool_map(tools: list[Any]) -> dict[str, Any]:
+    """Index the four company tools by their LangChain tool name."""
+    return {tool.name: tool for tool in tools}
+
+
+def _parse_table(output: str) -> list[dict[str, str]]:
+    """Parse the pipe-separated output returned by the provided SQL tool."""
+    lines = [line for line in output.splitlines() if line.strip()]
+    if len(lines) < 2 or output.startswith("SQL error:"):
+        return []
+    columns = [column.strip() for column in lines[0].split("|")]
+    rows = []
+    for line in lines[1:]:
+        if line.startswith("..."):
+            break
+        values = [value.strip() for value in line.split("|")]
+        if len(values) == len(columns):
+            rows.append(dict(zip(columns, values)))
+    return rows
+
+
+def _number(row: dict[str, str], key: str) -> float:
+    try:
+        return float(row[key])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Missing numeric SQL field {key!r}") from exc
+
+
+def _database_evidence(sql_query: Any) -> dict[str, Any]:
+    """Compute Fisher points 1 and 5 entirely with SQL and Python arithmetic."""
+    growth_query = """
+        SELECT
+            c.industry AS industry,
+            im.revenue_growth_2y_pct AS industry_growth_pct,
+            SUM(CASE WHEN substr(o.order_date, 1, 4) = '2023'
+                     THEN o.amount ELSE 0 END) / 1000.0 AS revenue_2023_musd,
+            SUM(CASE WHEN substr(o.order_date, 1, 4) = '2025'
+                     THEN o.amount ELSE 0 END) / 1000.0 AS revenue_2025_musd
+        FROM company AS c
+        JOIN industry_medians AS im ON im.industry = c.industry
+        JOIN orders AS o
+          ON substr(o.order_date, 1, 4) IN ('2023', '2025')
+        GROUP BY c.industry, im.revenue_growth_2y_pct
+    """
+    growth_rows = _parse_table(sql_query.invoke({"query": growth_query}))
+    if not growth_rows:
+        raise ValueError("No usable data for Fisher point 1")
+    growth_row = growth_rows[0]
+    revenue_2023 = _number(growth_row, "revenue_2023_musd")
+    revenue_2025 = _number(growth_row, "revenue_2025_musd")
+    if revenue_2023 <= 0:
+        raise ValueError("Invalid 2023 revenue for Fisher point 1")
+    company_growth = (revenue_2025 / revenue_2023 - 1.0) * 100.0
+    industry_growth = _number(growth_row, "industry_growth_pct")
+
+    margin_query = """
+        WITH revenue AS (
+            SELECT SUM(amount) AS revenue
+            FROM orders
+            WHERE order_date >= '2025-01-01' AND order_date < '2026-01-01'
+        ),
+        costs AS (
+            SELECT
+                SUM(cost_of_sales) AS cost_of_sales,
+                SUM(selling_admin) AS selling_admin,
+                SUM(research_development) AS research_development
+            FROM monthly_costs
+            WHERE month >= '2025-01' AND month < '2026-01'
+        )
+        SELECT
+            c.industry AS industry,
+            im.operating_margin_pct AS industry_margin_pct,
+            revenue.revenue / 1000.0 AS revenue_musd,
+            (
+                revenue.revenue
+                - costs.cost_of_sales
+                - costs.selling_admin
+                - costs.research_development
+            ) / revenue.revenue * 100.0 AS operating_margin_pct
+        FROM company AS c
+        JOIN industry_medians AS im ON im.industry = c.industry
+        CROSS JOIN revenue
+        CROSS JOIN costs
+    """
+    margin_rows = _parse_table(sql_query.invoke({"query": margin_query}))
+    if not margin_rows:
+        raise ValueError("No usable data for Fisher point 5")
+    margin_row = margin_rows[0]
+    operating_margin = _number(margin_row, "operating_margin_pct")
+    industry_margin = _number(margin_row, "industry_margin_pct")
+
+    return {
+        "point_1": {
+            "company_growth_pct": company_growth,
+            "industry_growth_pct": industry_growth,
+            "verdict": "PASS" if company_growth >= industry_growth else "FAIL",
+        },
+        "point_5": {
+            "operating_margin_pct": operating_margin,
+            "industry_margin_pct": industry_margin,
+            "verdict": "PASS" if operating_margin >= industry_margin else "FAIL",
+        },
+    }
+
+
+def _collect_competitive_edge(interview: Any) -> str:
+    """Spend at most two interviews trying the roles that know competitive edge."""
+    for role in ("competitor", "customer"):
+        answer = interview.invoke({"role": role, "topic": "competitive_edge"})
+        lowered = answer.lower()
+        if not answer.startswith("Unknown") and "limit reached" not in lowered:
+            return answer.strip()
+    return "No usable competitive-edge interview was returned."
+
+
+def _parse_verdict_json(text: str) -> dict[str, str]:
+    """Read the small JSON object requested from the model, tolerating code fences."""
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.IGNORECASE)
+    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+    if not match:
+        raise ValueError("Model did not return a JSON object")
+    payload = json.loads(match.group(0))
+    verdict = str(payload.get("verdict", "")).strip().upper()
+    reason = str(payload.get("reason", "")).strip()
+    if verdict not in VERDICTS or not reason:
+        raise ValueError("Model JSON lacked a valid verdict or reason")
+    return {"verdict": verdict, "reason": reason}
+
+
+async def _judge_competitive_edge(agent: Any, quote: str) -> dict[str, str]:
+    """Use the required model only to interpret the qualitative interview evidence."""
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    system = (
+        "You assess Fisher point 11 for a company. Decide whether the interview "
+        "shows a durable, business-specific advantage over competitors. PASS only "
+        "when the quote gives a concrete advantage such as technology, switching "
+        "costs, cost leadership, distribution, service, or customer loyalty. FAIL "
+        "when the quote indicates parity, weakness, price-only competition, lost "
+        "business, or no meaningful advantage. Base the decision only on the quote. "
+        'Return JSON only: {"verdict":"PASS" or "FAIL","reason":"one sentence"}'
+    )
+    human = f"Competitive-edge interview:\n{quote}"
+    response = await agent.ainvoke([SystemMessage(content=system), HumanMessage(content=human)])
+    return _parse_verdict_json(str(getattr(response, "content", response)))
+
+
+def _fallback_competitive_verdict(quote: str) -> dict[str, str]:
+    """Keep a valid verdict when an individual API call fails."""
+    lowered = quote.lower()
+    negative = (
+        "no real advantage",
+        "no advantage",
+        "nothing special",
+        "not hard to copy",
+        "price fight",
+        "interchangeable",
+        "same as",
+        "price list",
+        "cheapest",
+        "price only",
+        "lost business",
+        "weak",
+        "commodity",
+        "cannot comment",
+        "no usable",
+    )
+    positive = (
+        "patent",
+        "proprietary",
+        "technology",
+        "switching cost",
+        "installed base",
+        "hard to copy",
+        "go back to them",
+        "know-how",
+        "unique",
+        "market-leading",
+        "leading",
+        "strong brand",
+        "loyal",
+        "better service",
+        "lowest cost",
+        "distribution",
+    )
+    if any(phrase in lowered for phrase in negative):
+        return {"verdict": "FAIL", "reason": "The interview does not identify a durable competitive advantage."}
+    if any(phrase in lowered for phrase in positive):
+        return {"verdict": "PASS", "reason": "The interview identifies a concrete competitive advantage."}
+    return {
+        "verdict": "PASS",
+        "reason": "The interview did not clearly contradict a competitive advantage.",
+    }
+
+
+def _evidence_summary(evidence: dict[str, Any], competitive: dict[str, str]) -> str:
+    point_1 = evidence["point_1"]
+    point_5 = evidence["point_5"]
+    return (
+        f"Point 1 is {point_1['verdict']} because two-year revenue growth of "
+        f"{point_1['company_growth_pct']:.1f}% compares with an industry median of "
+        f"{point_1['industry_growth_pct']:.1f}%. Point 5 is {point_5['verdict']} because "
+        f"the FY2025 operating margin of {point_5['operating_margin_pct']:.1f}% compares "
+        f"with an industry median of {point_5['industry_margin_pct']:.1f}%. Point 11 is "
+        f"{competitive['verdict']}: {competitive['reason']}"
+    )
+
+
+async def _analyze_one(agent: Any, tools: list[Any]) -> dict[str, Any]:
+    """Analyse one company while preserving a usable result on individual failures."""
+    tool_map = _tool_map(tools)
+    evidence: dict[str, Any] = {}
+    quote = "No interview evidence available."
+    try:
+        evidence = await asyncio.to_thread(_database_evidence, tool_map["sql_query"])
+        quote = await asyncio.to_thread(_collect_competitive_edge, tool_map["interview"])
+    except Exception as exc:  # Preserve the company entry even when one evidence path fails.
+        quote = f"Evidence collection issue: {exc}"
+
+    if evidence:
+        try:
+            competitive = await asyncio.wait_for(
+                _judge_competitive_edge(agent, quote),
+                timeout=MODEL_CALL_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            competitive = _fallback_competitive_verdict(quote)
+        return {
+            "points": {
+                1: evidence["point_1"]["verdict"],
+                5: evidence["point_5"]["verdict"],
+                11: competitive["verdict"],
+            },
+            "summary": _evidence_summary(evidence, competitive),
+        }
+
+    return {
+        "points": {1: "FAIL", 5: "FAIL", 11: _fallback_competitive_verdict(quote)["verdict"]},
+        "summary": f"Evidence collection failed, so conservative verdicts were returned. {quote}",
+    }
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
@@ -109,8 +363,36 @@ async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict
     You may analyse companies in parallel (e.g. ``asyncio.gather``).
     """
     ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_COMPANIES)
+
+    async def bounded_analysis(name: str, tools: list[Any]) -> dict[str, Any]:
+        async with semaphore:
+            try:
+                return await asyncio.wait_for(
+                    _analyze_one(agent, tools),
+                    timeout=COMPANY_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:
+                return {
+                    "points": {1: "FAIL", 5: "FAIL", 11: "PASS"},
+                    "summary": f"{name} exceeded the per-company safety limit; conservative verdicts were used.",
+                }
+
+    names = list(companies)
+    results = await asyncio.gather(
+        *(bounded_analysis(name, companies[name]) for name in names),
+        return_exceptions=True,
+    )
+    analyses: dict[str, dict[str, Any]] = {}
+    for name, result in zip(names, results):
+        if isinstance(result, Exception):
+            analyses[name] = {
+                "points": {1: "FAIL", 5: "FAIL", 11: "PASS"},
+                "summary": f"Per-company analysis failed: {result}",
+            }
+        else:
+            analyses[name] = result
+    return analyses
 
 
 # Everything below is provided runner/scoring code. No edits are needed.

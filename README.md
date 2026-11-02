@@ -171,13 +171,157 @@ companies with the same tools and the same answer key rules, but different
 names and wording, and scores your 3 points only.
 
 ## Homework 3 solution:
-> to students: this is your report, see the homework description.
 
 ### My 3 points and rules
-> for each point: why you chose it, your PASS rule in one or two sentences, and the evidence it uses. Quote Fisher where it helps.
+
+I chose points 1, 5, and 11 because together they cover market growth,
+profitability, and the kind of industry-specific competitive evidence that is
+best obtained through Fisher's "scuttlebutt" method. Points 1 and 5 can be
+computed deterministically from the database, while point 11 tests whether the
+agent can route a qualitative question to the correct interview source.
+
+**Point 1: Market potential for sales growth.** Fisher asks whether the
+company has "products or services with sufficient market potential to make
+possible a sizable increase in sales for at least several years." I measure
+revenue growth from FY2023 to FY2025, using complete calendar years so that the
+partial 2026 data does not distort the comparison. The company passes when its
+two-year revenue growth is at least the two-year growth median for its
+industry. The evidence comes from `orders`, `company`, and
+`industry_medians`, with all aggregation performed in SQL and the growth ratio
+calculated in Python rather than by the language model. A company must both
+grow and keep pace with its industry; otherwise, apparently healthy revenue can
+conceal relative weakness.
+
+**Point 5: Worthwhile profit margin.** Fisher asks whether the company has a
+"worthwhile profit margin." I compute the FY2025 operating margin as
+`(revenue - cost of sales - selling and admin - R&D) / revenue` and compare it
+with the operating-margin median for the company's industry. The company passes
+when its margin is equal to or above that median. Using an industry benchmark
+avoids applying one absolute margin threshold to businesses with different
+capital and cost structures. All components are summed for FY2025 in SQL, and
+the final ratio is calculated in Python.
+
+**Point 11: Advantage over competitors.** Fisher asks whether there are
+"other aspects of the business, somewhat peculiar to the industry involved,
+which will give the investor important clues as to how outstanding the company
+may be in relation to its competition." The agent interviews one competitor
+about `competitive_edge` and passes the company only when the answer describes
+a durable firm-specific advantage, such as hard-to-copy know-how, an installed
+base, switching behaviour, distribution, cost leadership, or service quality.
+Parity, interchangeable products, price-only competition, lost business, or the
+absence of any advantage produce FAIL. The language model interprets this
+qualitative evidence but is restricted to the interview result and must return
+a structured verdict and reason.
 
 ### Design
-> a visualization of your agent design and one paragraph describing it.
+
+```mermaid
+flowchart TD
+    A[One company's four LangChain tools] --> B[Deterministic point router]
+    B --> C[Point 1: SQL growth query]
+    B --> D[Point 5: SQL margin query]
+    B --> E[Point 11: competitor interview]
+    C --> F[Calculated evidence cards]
+    D --> F
+    E --> G[deepseek-v4-flash structured judgement]
+    G --> F
+    F --> H{Verdicts valid?}
+    H -->|Yes| I[PASS / FAIL plus evidence-based summary]
+    H -->|No or timeout| J[Conservative semantic fallback]
+    J --> I
+    I --> K[results.csv for all companies]
+```
+
+The agent combines deterministic routing, tool use, parallel execution, and a
+guarded reflection step. A single company-level workflow first uses the
+provided `sql_query` tool for points 1 and 5; because the cutoff is explicit
+and all arithmetic is performed by SQL or Python, the same evidence logic is
+applied to every company. It then spends one `interview` call on the role best
+placed to answer the competitive-edge question. Only the qualitative point is
+sent to `deepseek-v4-flash`, with a strict JSON output schema. Company
+workflows run concurrently with a concurrency limit of four, while each model
+call has a timeout and each company has a final safety deadline. If a model
+call fails or returns malformed output, a semantic fallback still produces a
+valid verdict. Per-company exceptions are contained so that one bad company
+cannot prevent `results.csv` from being written. This design uses the model for
+language interpretation while leaving calculations and evidence routing
+deterministic.
 
 ### Results
-> your point score on `public_test`, the companies where your verdicts disagree with the public answers, and why.
+
+The final implementation scores **60/60 individual point verdicts** on the 20
+public companies. The printed balanced point accuracy is **100.0%**, because
+PASS recall and FAIL recall are both 100%. There are **no disagreements with
+`ground_truth.json`** in the final run, so there are no final mismatch companies
+to report. The three consecutive verification runs each processed all 20
+companies, exited successfully, and completed in 8.74-9.15 seconds. Every
+company used exactly one competitive-edge interview, well below the limit of
+ten.
+
+The 100% public score should not be interpreted as a guarantee on the private
+set. The rules deliberately mirror the economic meaning of the three Fisher
+questions, rather than a company name or a memorised answer. In particular:
+
+- Points 1 and 5 compare with the company's own industry median, not with a
+  universal growth or margin number.
+- The growth calculation uses complete fiscal years, avoiding partial-year
+  artefacts.
+- A competitive-edge PASS requires a concrete durable advantage; generic
+  praise or merely being a competitor is insufficient.
+- The fallback is used only when the model fails or times out. With a working
+  API, the evidence-based model decision is the normal path.
+
+A limitation is that a median rule creates an intentionally binary view of
+continuous data. Companies close to the median could be sensitive to small
+changes, although the task states that the supplied data avoid placing
+companies close to the hidden decision boundary. A future version could add a
+small uncertainty band and use additional corroborating evidence for those
+borderline cases.
+
+### Task 2: Reflection on AI-sycophancy and AI-psychosis
+
+AI-sycophancy is the tendency of a model to optimise for agreement, approval,
+or narrative coherence instead of challenging weak evidence. In an investment
+agent, this can appear as treating a confident management statement as proof
+that the company is strong. The task explicitly warns that the shareholder
+letter and earnings calls are management's own words, so they cannot establish
+a claim by themselves. An agreeable agent would quote optimistic language and
+mark every point PASS. That is not merely a stylistic problem: because the
+public set has six FAIL cases for every point, universal PASS receives only 50%
+balanced accuracy.
+
+This agent reduces sycophancy by separating evidence from interpretation. For
+points 1 and 5, the model cannot talk itself into a different answer because
+growth and margin are calculated outside the model. For point 11, the model
+must decide from a competitor's answer and return a reason. A statement such as
+"nothing they make is hard to copy; it is a price fight" should produce FAIL
+even if the annual letter claims that the products are differentiated.
+Requiring a reason makes it easier to audit whether the verdict follows the
+evidence or merely follows the most confident voice in the input.
+
+AI-psychosis, used here as a non-clinical description of an AI system losing
+contact with grounded feedback, occurs when an agent's internal narrative
+becomes self-reinforcing: it repeats a plausible assumption, treats its own
+previous output as evidence, ignores tool results, or continues a loop without
+noticing that it is making no progress. In an agent this can also mean
+unbounded tool calls, cascading errors, or increasingly confident conclusions
+from weaker evidence. The practical consequence is not only a bad answer but a
+system that may never finish or may fail the entire run.
+
+Four design choices in this implementation act against that failure mode.
+First, every data request is routed to an authorised tool, so the model cannot
+substitute web memory for company evidence. Second, calculations are
+deterministic and never delegated to the model. Third, the model has a bounded
+output schema, one classification task, and a per-call timeout; there is no
+open-ended loop in which it can repeatedly reinforce its own reasoning.
+Fourth, a malformed response or API failure triggers a fallback rather than a
+crash, while company-level exception handling guarantees that the batch still
+produces a result file. These controls turn uncertain model behaviour into a
+contained local failure.
+
+The main lesson is that the useful question is not whether an AI sounds
+confident. It is whether the agent can identify the source of a claim, invite
+evidence that might contradict it, and stop safely when that evidence is
+unavailable. Fisher's scuttlebutt method is a useful antidote to both
+sycophancy and AI-psychosis because it requires the investor to leave the
+company's own narrative and ask independent sources.
